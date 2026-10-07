@@ -35,7 +35,7 @@ public class MouseQuickTileService extends TileService {
         if (android.os.Build.VERSION.SDK_INT >= 29) {
             t.setIcon(Icon.createWithResource(this, com.fastkeyboard.nova.R.drawable.ic_launcher));
         }
-        t.setLabel("موس Fast KK 1");
+        t.setLabel("موس Fast-Keys_02");
         t.updateTile();
     }
 }

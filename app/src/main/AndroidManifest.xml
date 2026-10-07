@@ -24,7 +24,7 @@
 
         <service
             android:name=".MouseAccessibilityService"
-            android:label="موس Fast KK 1"
+            android:label="موس Fast-Keys_02"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
             android:exported="true">
             <intent-filter>
@@ -37,7 +37,7 @@
 
         <service
             android:name=".KeyboardAccessibilityService"
-            android:label="Fast KK 1 — ارسال و فایل"
+            android:label="Fast-Keys_02 — ارسال و فایل"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
             android:exported="true">
             <intent-filter>
@@ -56,7 +56,7 @@
 
         <service
             android:name=".MouseQuickTileService"
-            android:label="موس Fast KK 1"
+            android:label="موس Fast-Keys_02"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
             android:exported="true">
             <intent-filter>

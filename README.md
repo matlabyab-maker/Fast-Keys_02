@@ -1,6 +1,6 @@
-# Fast_KK_1
+# Fast-Keys_02
 
-**Fast_KK_1 v1.49** — پروژه مستقل کیبورد اندروید و ابزارهای کنترل ماوس/دسترسی مرتبط با آن.
+**Fast-Keys_02 v1.57** — پروژه مستقل کیبورد اندروید و ابزارهای کنترل ماوس/دسترسی مرتبط با آن.
 
 ## وضعیت این Repository
 
@@ -19,7 +19,7 @@
 
 ## بخش‌های اصلی پروژه
 
-- کیبورد Fast_KK_1 و سرویس Input Method
+- کیبورد Fast-Keys_02 و سرویس Input Method
 - سرویس‌های Accessibility و کنترل ماوس
 - پنجره/کنترل‌های ماوس و Quick Settings مرتبط
 - منابع و تنظیمات Accessibility
@@ -29,7 +29,7 @@
 ## ساختار
 
 ```text
-Fast_KK_1/
+Fast-Keys_02/
 ├── app/
 ├── .github/workflows/android.yml
 ├── docs/history/
@@ -46,7 +46,7 @@ Workflow موجود با GitHub Actions اجرا می‌شود و به‌صور�
 
 خروجی Debug با نام Artifact زیر منتشر می‌شود:
 
-`Fast_KK_1-debug-apk`
+`Fast-Keys_02-debug-apk`
 
 ## نکته مهم برای Repository جدید
 
