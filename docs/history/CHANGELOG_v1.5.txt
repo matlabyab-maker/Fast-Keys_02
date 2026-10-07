@@ -1,0 +1,3 @@
+Fast_KK_1 v1.5
+
+Added the user-provided Persian message sentences and phrases to the suggestion dictionary.

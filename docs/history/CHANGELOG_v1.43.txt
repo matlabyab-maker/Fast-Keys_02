@@ -1,0 +1,7 @@
+Fast_KK_1 v1.43
+
+- Added the TCP Wi‑Fi receiver for Fast_Remote_1.
+- Added the shared FKREMOTE v1 handshake and mouse command protocol.
+- Added Wi‑Fi connection information (local IPv4 + port 38555) to MainActivity.
+- Added INTERNET and ACCESS_NETWORK_STATE permissions required for the receiver.
+- Existing keyboard and mouse UI behavior was otherwise preserved.

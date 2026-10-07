@@ -1,0 +1,8 @@
+Fast_KK_1 v1.46
+
+- Fixed mouse control window bottom-row touch targets to match the current 430x287 reference image.
+- Removed obsolete bottom arrow controls and old top-right control targets that were not present in the new image.
+- Bottom controls are now: Left Click, Drag, Point Zoom, Close.
+- Each visible bottom button has its own press highlight.
+- Drag moves the mouse control window without triggering Left Click.
+- Point Zoom and Close retain their functions.

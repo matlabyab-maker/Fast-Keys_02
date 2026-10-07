@@ -1,0 +1,1794 @@
+package com.fastkeyboard.nova;
+
+import android.accessibilityservice.AccessibilityService;
+import android.accessibilityservice.GestureDescription;
+import android.accessibilityservice.AccessibilityServiceInfo;
+import android.graphics.Color;
+import android.graphics.Rect;
+import android.view.accessibility.AccessibilityWindowInfo;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.ColorSpace;
+import android.hardware.HardwareBuffer;
+import android.view.Display;
+import android.util.DisplayMetrics;
+import android.widget.ImageView;
+import android.graphics.Path;
+import android.graphics.PixelFormat;
+import android.graphics.drawable.GradientDrawable;
+import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
+import android.view.Gravity;
+import android.view.WindowManager;
+import android.view.View;
+import android.view.accessibility.AccessibilityEvent;
+import android.view.accessibility.AccessibilityNodeInfo;
+import android.app.usage.UsageStats;
+import android.app.usage.UsageStatsManager;
+import android.widget.TextView;
+import android.widget.FrameLayout;
+import android.widget.Button;
+import android.widget.LinearLayout;
+import android.widget.SeekBar;
+import android.view.MotionEvent;
+import android.graphics.Typeface;
+import java.util.ArrayList;
+import java.util.concurrent.Executor;
+
+public class MouseAccessibilityService extends AccessibilityService {
+    private static MouseAccessibilityService instance;
+    private TouchRemoteWifiReceiver touchRemoteWifiReceiver;
+    private WindowManager wm;
+    private ComputerCursorView cursor;
+    private final Handler handler = new Handler(Looper.getMainLooper());
+    private float x = -1, y = -1;
+    private int screenW, screenH;
+    private int cursorSize;
+    private boolean dragMode=false;
+    private View mousePanel;
+    private WindowManager.LayoutParams mousePanelLp;
+    private int requestedMouseX = -1, requestedMouseY = -1;
+    private boolean autoTargetMode = false;
+    private AccessibilityNodeInfo snappedTarget;
+    private android.graphics.Rect snappedTargetRect;
+    private boolean snapReleased = true;
+    private Button autoTargetButton;
+    private View magnifierView;
+    private WindowManager.LayoutParams magnifierLp;
+    private Bitmap magnifierBitmap;
+    private boolean magnifierEnabled=false;
+    private boolean magnifierCapturePending=false;
+    private long lastMagnifierCaptureMs=0L;
+    private boolean selectMode=false;
+    // Remote page-scroll smoothing state. Only one synthetic gesture runs at a time;
+    // the next small step starts from the gesture completion callback. This avoids
+    // overlapping Accessibility gestures, which previously made held scrolling
+    // feel sticky or miss repeated movements.
+    private int remoteScrollDirection=0;
+    private boolean remoteScrollRunning=false;
+    private boolean selectionGestureActive=false;
+    private float selectionStartX=0f, selectionStartY=0f;
+    private long lastPadTapMs=0L;
+    private float lastPadTapX=0f, lastPadTapY=0f;
+    private String lastTargetPackage="";
+    private int cursorSizeStep=1;
+    private final int[] cursorSizeDp={30,42,58,76};
+    private final java.util.ArrayList<Button> mouseButtons=new java.util.ArrayList<>();
+    private static final int LIGHT_BLUE=0xFF8FD3FF, LIGHT_CREAM=0xFFFFF0B3, LIGHT_GREEN=0xFFBFE8BF, LIGHT_YELLOW=0xFFFFE48A, LIGHT_ORANGE=0xFFFFB18A;
+    private final Runnable autoTargetRunnable = new Runnable() {
+        @Override public void run() {
+            // Snap is checked directly after pointer movement; no periodic tree scan.
+            if (autoTargetMode) handler.postDelayed(this, 250);
+        }
+    };
+
+    public static MouseAccessibilityService getInstance() { return instance; }
+
+    @Override public void onServiceConnected() {
+        super.onServiceConnected();
+        instance = this;
+        touchRemoteWifiReceiver = new TouchRemoteWifiReceiver(this);
+        touchRemoteWifiReceiver.start();
+        wm = (WindowManager)getSystemService(WINDOW_SERVICE);
+        android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
+        screenW = dm.widthPixels;
+        screenH = dm.heightPixels;
+        // Use the real physical display bounds so the cursor can travel through
+        // the Android status bar and navigation bar as well as the app area.
+        try {
+            android.view.Display display = wm.getDefaultDisplay();
+            android.util.DisplayMetrics real = new android.util.DisplayMetrics();
+            display.getRealMetrics(real);
+            screenW = real.widthPixels;
+            screenH = real.heightPixels;
+        } catch (Throwable ignored) {}
+        cursorSize = Math.max(42, Math.round(42 * dm.density));
+        AccessibilityServiceInfo info = getServiceInfo();
+        if (info != null) {
+            info.flags |= AccessibilityServiceInfo.FLAG_REQUEST_FILTER_KEY_EVENTS;
+            if (Build.VERSION.SDK_INT >= 21) {
+                info.flags |= AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS;
+            }
+            setServiceInfo(info);
+        }
+    }
+
+    public static void showCursorFromKeyboard() {
+        MouseAccessibilityService s=instance;
+        if(s!=null) s.showCursor();
+    }
+
+    /** Show the desktop pointer as soon as the Remote_For_Fast_Keys handshake succeeds. */
+    public void showCursorFromRemote() {
+        showCursor();
+    }
+
+    public static void hideCursorFromKeyboard() {
+        MouseAccessibilityService s=instance;
+        if(s!=null) s.hideCursor();
+    }
+
+    public boolean isMouseOverlayShown() { return mousePanel != null; }
+
+    public static void showMouseOverlayFromKeyboard(int x, int y) {
+        MouseAccessibilityService s=instance;
+        if(s==null) return;
+        s.requestedMouseX=x; s.requestedMouseY=y;
+        s.showMouseOverlay();
+    }
+
+    /** Cycle the mouse-control overlay through practical sizes for the Quick Settings tile. */
+    public void cycleMousePanelSize() {
+        if (wm == null) return;
+        if (mousePanel == null) showMouseOverlay();
+        if (mousePanelLp == null || mousePanel == null) return;
+        final int minW = dp(220);
+        final int maxW = Math.max(minW, screenW - dp(8));
+        int currentW = mousePanelLp.width;
+        int targetW;
+        if (currentW < dp(320)) targetW = dp(360);
+        else if (currentW < dp(430)) targetW = dp(430);
+        else targetW = dp(300);
+        targetW = Math.max(minW, Math.min(maxW, targetW));
+        int targetH = Math.max(dp(147), Math.round(targetW * 287f / 430f));
+        targetH = Math.min(targetH, Math.max(dp(147), screenH - dp(8)));
+        int oldRight = mousePanelLp.x + mousePanelLp.width;
+        int oldBottom = mousePanelLp.y + mousePanelLp.height;
+        mousePanelLp.width = targetW;
+        mousePanelLp.height = targetH;
+        mousePanelLp.x = Math.max(0, Math.min(screenW-targetW, oldRight-targetW));
+        mousePanelLp.y = Math.max(0, Math.min(screenH-targetH, oldBottom-targetH));
+        try { wm.updateViewLayout(mousePanel, mousePanelLp); } catch (Exception ignored) {}
+    }
+
+    public void showMouseOverlay() {
+        if (wm == null) return;
+        if (mousePanel != null) return;
+        showCursor();
+
+        // The current mouse-control artwork is exactly 430x287 pixels.
+        // Only the controls visible in that artwork are interactive:
+        // Touchpad, Left Click, Drag, Point Zoom and Close.
+        final int imageW = 430;
+        final int imageH = 287;
+        final int panelW = Math.min(dp(imageW), Math.max(dp(200), screenW - dp(8)));
+        final int panelH = Math.max(dp(132), Math.round(panelW * imageH / (float) imageW));
+
+        final FrameLayout panel = new FrameLayout(this);
+        panel.setClipChildren(false);
+        panel.setClipToPadding(false);
+        panel.setBackgroundColor(Color.WHITE);
+
+        ImageView reference = new ImageView(this);
+        reference.setImageBitmap(BitmapFactory.decodeResource(getResources(), R.drawable.mouse_reference));
+        reference.setScaleType(ImageView.ScaleType.FIT_XY);
+        reference.setClickable(false);
+        panel.addView(reference, new FrameLayout.LayoutParams(-1, -1));
+
+        final java.util.ArrayList<View> hitViews = new java.util.ArrayList<>();
+
+        // Coordinates match the current 430x287 image, not the previous mouse panel.
+        final View touchPad  = transparentHit(panel, 0,   0,   430, 210, hitViews);
+        final View leftClick = transparentHit(panel, 0,   210, 126, 77,  hitViews);
+        final View drag      = transparentHit(panel, 126, 210, 127, 77,  hitViews);
+        final View pointZoom = transparentHit(panel, 253, 210, 87,  77,  hitViews);
+        final View close     = transparentHit(panel, 340, 210, 90,  77,  hitViews);
+
+        // Each visible button gets its own press light. The listener returns false
+        // so the normal click listener below still receives the same touch event.
+        attachYellowPress(leftClick);
+        attachYellowPress(drag);
+        attachYellowPress(pointZoom);
+        attachYellowPress(close);
+
+        panel.addOnLayoutChangeListener((v,l,t,r,b,ol,ot,or,ob)->{
+            int w = r-l, h = b-t;
+            setHit(panel, touchPad,  0,   0,   430, 210, w, h);
+            setHit(panel, leftClick, 0,   210, 126, 77,  w, h);
+            setHit(panel, drag,      126, 210, 127, 77,  w, h);
+            setHit(panel, pointZoom, 253, 210, 87,  77,  w, h);
+            setHit(panel, close,     340, 210, 90,  77,  w, h);
+        });
+
+        close.setOnClickListener(v -> hideMouseOverlay());
+        leftClick.setOnClickListener(v -> click(false));
+        pointZoom.setOnClickListener(v -> toggleMagnifier());
+
+        // Drag button: move the mouse-control window itself without triggering
+        // a left click when the finger is released.
+        final float[] dragLast = {0f, 0f};
+        drag.setOnTouchListener((v,e)->{
+            if (e.getAction() == MotionEvent.ACTION_DOWN) {
+                dragLast[0] = e.getRawX();
+                dragLast[1] = e.getRawY();
+                pressLight(v);
+                return true;
+            }
+            if (e.getAction() == MotionEvent.ACTION_MOVE) {
+                if (mousePanelLp != null && wm != null) {
+                    float dx = e.getRawX() - dragLast[0];
+                    float dy = e.getRawY() - dragLast[1];
+                    mousePanelLp.x += Math.round(dx);
+                    mousePanelLp.y += Math.round(dy);
+                    mousePanelLp.x = Math.max(0, Math.min(screenW - mousePanelLp.width, mousePanelLp.x));
+                    mousePanelLp.y = Math.max(0, Math.min(screenH - mousePanelLp.height, mousePanelLp.y));
+                    try { wm.updateViewLayout(mousePanel, mousePanelLp); } catch (Exception ignored) {}
+                    dragLast[0] = e.getRawX();
+                    dragLast[1] = e.getRawY();
+                }
+                return true;
+            }
+            if (e.getAction() == MotionEvent.ACTION_UP || e.getAction() == MotionEvent.ACTION_CANCEL) {
+                clearPressLight(v);
+                // Android may raise the IME window over accessibility overlays
+                // after a drag changes the overlay's position. Reassert the
+                // mouse panel's z-order after the gesture has fully ended, so
+                // reattaching it cannot interrupt the active drag gesture.
+                if (e.getAction() == MotionEvent.ACTION_UP) {
+                    handler.postDelayed(this::reassertMouseOverlayOnTop, 80L);
+                    handler.postDelayed(this::reassertMouseOverlayOnTop, 260L);
+                }
+                return true;
+            }
+            return true;
+        });
+
+        // Touchpad: first tap = left click at the current pointer position.
+        // A second tap held and dragged = mouse-like text selection. A normal
+        // one-finger move still only moves the pointer.
+        final float[] padLast = {0f,0f};
+        final boolean[] padMoving = {false};
+        final boolean[] tapMoved = {false};
+        touchPad.setOnTouchListener((v,e)->{
+            if (e.getAction()==MotionEvent.ACTION_DOWN) {
+                long now = System.currentTimeMillis();
+                float tx=e.getRawX(), ty=e.getRawY();
+                boolean secondTap = (now-lastPadTapMs) <= 520L &&
+                        Math.hypot(tx-lastPadTapX, ty-lastPadTapY) <= dp(34);
+                padLast[0]=tx; padLast[1]=ty;
+                padMoving[0]=true; tapMoved[0]=false;
+                if (secondTap) {
+                    selectionGestureActive=true;
+                    selectionStartX=x+3f; selectionStartY=y+3f;
+                    releaseSnap();
+                } else {
+                    selectionGestureActive=false;
+                }
+                lastPadTapMs=now; lastPadTapX=tx; lastPadTapY=ty;
+                return true;
+            }
+            if (e.getAction()==MotionEvent.ACTION_MOVE && padMoving[0]) {
+                float dx=e.getRawX()-padLast[0], dy=e.getRawY()-padLast[1];
+                if (Math.abs(dx)>=0.5f || Math.abs(dy)>=0.5f) {
+                    tapMoved[0]=true;
+                    moveRelative(dx*1.15f,dy*1.15f);
+                    padLast[0]=e.getRawX(); padLast[1]=e.getRawY();
+                }
+                return true;
+            }
+            if (e.getAction()==MotionEvent.ACTION_UP || e.getAction()==MotionEvent.ACTION_CANCEL) {
+                if (e.getAction()==MotionEvent.ACTION_UP) {
+                    float endX=x+3f, endY=y+3f;
+                    if (selectionGestureActive) {
+                        if (tapMoved[0] && (Math.abs(endX-selectionStartX)>=4f || Math.abs(endY-selectionStartY)>=4f)) {
+                            dispatchSwipe(selectionStartX, selectionStartY, endX, endY, 700L);
+                        }
+                    } else if (!tapMoved[0]) {
+                        click(false);
+                    }
+                }
+                selectionGestureActive=false;
+                padMoving[0]=false;
+                return true;
+            }
+            return true;
+        });
+
+        // Quick Settings uses the same mouse artwork and the same two corner resize controls.
+        addResizeHandle(panel, Gravity.TOP | Gravity.LEFT, -1, 1);
+        addResizeHandle(panel, Gravity.TOP | Gravity.RIGHT, 1, 1);
+
+        mousePanel = panel;
+        int xPos = requestedMouseX >= 0 ? requestedMouseX : screenW-panelW-dp(8);
+        int yPos = requestedMouseY >= 0 ? requestedMouseY : dp(72);
+        requestedMouseX=-1; requestedMouseY=-1;
+        xPos=Math.max(0,Math.min(Math.max(0,screenW-panelW),xPos));
+        yPos=Math.max(0,Math.min(Math.max(0,screenH-panelH),yPos));
+        mousePanelLp = new WindowManager.LayoutParams(
+            panelW, panelH,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL |
+            WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM |
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT);
+        mousePanelLp.gravity = Gravity.TOP | Gravity.LEFT;
+        mousePanelLp.x=xPos; mousePanelLp.y=yPos;
+        panel.setElevation(30f);
+        wm.addView(panel,mousePanelLp);
+
+        // Some Android versions re-stack the IME window above an accessibility
+        // overlay shortly after the IME is shown. Re-attach this panel a few
+        // times after creation so the mouse window remains the upper window.
+        // This does not affect the keyboard itself and is only done while the
+        // panel is being opened.
+        handler.postDelayed(this::reassertMouseOverlayOnTop, 180L);
+        handler.postDelayed(this::reassertMouseOverlayOnTop, 550L);
+        handler.postDelayed(this::reassertMouseOverlayOnTop, 1000L);
+    }
+
+    private void reassertMouseOverlayOnTop() {
+        if (mousePanel == null || mousePanelLp == null || wm == null) return;
+        try {
+            wm.removeViewImmediate(mousePanel);
+            wm.addView(mousePanel, mousePanelLp);
+        } catch (Throwable ignored) {
+            try {
+                if (mousePanel.getWindowToken() == null) wm.addView(mousePanel, mousePanelLp);
+            } catch (Throwable ignoredAgain) {}
+        }
+    }
+
+    private void attachYellowPress(View v){
+        if(v==null) return;
+        v.setOnTouchListener((view,e)->{
+            if(e.getAction()==MotionEvent.ACTION_DOWN){
+                pressLight(view);
+            } else if(e.getAction()==MotionEvent.ACTION_UP || e.getAction()==MotionEvent.ACTION_CANCEL){
+                clearPressLight(view);
+            }
+            return false;
+        });
+    }
+
+    private void pressLight(View view){
+        android.graphics.drawable.ColorDrawable glow = new android.graphics.drawable.ColorDrawable(0xFFFFE45C);
+        glow.setAlpha(155);
+        view.setForeground(glow);
+    }
+
+    private void clearPressLight(View view){
+        view.setForeground(null);
+    }
+
+    private View transparentHit(FrameLayout parent,int x,int y,int w,int h,java.util.ArrayList<View> list){
+        View v=new View(this);
+        v.setBackgroundColor(Color.TRANSPARENT);
+        v.setClickable(true);
+        parent.addView(v,new FrameLayout.LayoutParams(1,1));
+        list.add(v);
+        return v;
+    }
+
+    private void setHit(FrameLayout parent,View v,int x,int y,int w,int h,int pw,int ph){
+        FrameLayout.LayoutParams lp=(FrameLayout.LayoutParams)v.getLayoutParams();
+        lp.leftMargin=Math.round(x*pw/430f);
+        lp.topMargin=Math.round(y*ph/287f);
+        lp.width=Math.max(1,Math.round(w*pw/430f));
+        lp.height=Math.max(1,Math.round(h*ph/287f));
+        v.setLayoutParams(lp);
+    }
+
+    private void installMouseTap(Button b, int color, final Runnable action){
+        b.setEnabled(true);
+        b.setClickable(true);
+        b.setOnTouchListener((v,e)->{
+            if(e.getAction()==MotionEvent.ACTION_DOWN){ flashAllMouseButtons(color); return true; }
+            if(e.getAction()==MotionEvent.ACTION_UP){ if(action!=null) action.run(); return true; }
+            if(e.getAction()==MotionEvent.ACTION_CANCEL){ return true; }
+            return true;
+        });
+    }
+
+    private void flashAllMouseButtons(int color){
+        android.graphics.drawable.ColorDrawable glow=new android.graphics.drawable.ColorDrawable(color);
+        glow.setAlpha(95);
+        for(Button b:mouseButtons){ if(b!=null) b.setForeground(glow.getConstantState()!=null ? glow.getConstantState().newDrawable() : new android.graphics.drawable.ColorDrawable(color)); }
+        handler.removeCallbacks(clearMouseButtonLights);
+        handler.postDelayed(clearMouseButtonLights,180);
+    }
+    private final Runnable clearMouseButtonLights=()->{ for(Button b:mouseButtons){ if(b!=null) b.setForeground(null); } };
+
+    private void cycleCursorSize() {
+        cursorSizeStep=(cursorSizeStep+1)%cursorSizeDp.length;
+        int newSize=dp(cursorSizeDp[cursorSizeStep]);
+        cursorSize=newSize;
+        if(cursor==null || wm==null) return;
+        WindowManager.LayoutParams lp=(WindowManager.LayoutParams)cursor.getTag();
+        float centerX=x+((int)lp.width)/2f, centerY=y+((int)lp.height)/2f;
+        lp.width=newSize; lp.height=newSize;
+        x=Math.max(0,Math.min(screenW-newSize,centerX-newSize/2f));
+        y=Math.max(0,Math.min(screenH-newSize,centerY-newSize/2f));
+        lp.x=Math.round(x); lp.y=Math.round(y);
+        try{wm.updateViewLayout(cursor,lp);}catch(Exception ignored){}
+    }
+
+    private void toggleMagnifier() {
+        if (magnifierEnabled) {
+            magnifierEnabled = false;
+            hideMagnifier();
+            if (Build.VERSION.SDK_INT >= 24) {
+                try { getMagnificationController().reset(false); } catch (Exception ignored) {}
+            }
+            try {
+                stopService(new android.content.Intent(this, ScreenCaptureService.class));
+            } catch (Exception ignored) {}
+            return;
+        }
+
+        magnifierEnabled = true;
+
+        // API 30+ can capture the display directly from AccessibilityService.
+        // Use our own small physical lens so Point Zoom is a compact 3 cm x 2 cm window.
+        if (Build.VERSION.SDK_INT >= 30) {
+            updateMagnifier();
+            return;
+        }
+
+        // Android 10/9 and similar versions do not expose the Accessibility screenshot
+        // API. Prefer the Accessibility magnification controller so Point Zoom responds
+        // immediately to the remote button without requiring a foreground Activity or a
+        // second permission dialog. It is reset on the next Point Zoom press.
+        if (Build.VERSION.SDK_INT >= 24) {
+            try {
+                AccessibilityService.MagnificationController mc = getMagnificationController();
+                if (mc != null) {
+                    float cx = x + cursorSize / 2f;
+                    float cy = y + cursorSize / 2f;
+                    mc.setScale(2.2f, false);
+                    mc.setCenter(cx, cy, false);
+                    return;
+                }
+            } catch (Exception ignored) { }
+        }
+
+        // Final fallback: ask for MediaProjection permission when the device cannot
+        // control Accessibility magnification directly.
+        try {
+            android.content.Intent i = new android.content.Intent(this, MainActivity.class);
+            i.putExtra(MainActivity.EXTRA_REQUEST_POINT_ZOOM_CAPTURE, true);
+            i.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK | android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            startActivity(i);
+        } catch (Exception ignored) {
+            // Keep the state off if Android refuses to launch the permission UI.
+            magnifierEnabled = false;
+        }
+    }
+
+    private void updateMagnifier() {
+        if(!magnifierEnabled || Build.VERSION.SDK_INT<30) return;
+        long now = android.os.SystemClock.uptimeMillis();
+        if (magnifierCapturePending || now - lastMagnifierCaptureMs < 70L) return;
+        magnifierCapturePending = true;
+        lastMagnifierCaptureMs = now;
+        try {
+            Executor ex = command -> handler.post(command);
+            takeScreenshot(Display.DEFAULT_DISPLAY, ex, new TakeScreenshotCallback() {
+                @Override public void onSuccess(ScreenshotResult result) {
+                HardwareBuffer hb=null;
+                Bitmap source=null;
+                try {
+                    hb=result.getHardwareBuffer();
+                    ColorSpace cs=result.getColorSpace();
+                    if(hb!=null){
+                        Bitmap hw=Bitmap.wrapHardwareBuffer(hb,cs);
+                        if(hw!=null){source=hw.copy(Bitmap.Config.ARGB_8888,false);hw.recycle();}
+                    }
+                    if(source==null)return;
+                    int radiusX=Math.max(24, Math.round(physicalPx(12f,true)));
+                    int radiusY=Math.max(16, Math.round(physicalPx(8f,false)));
+                    int cx=Math.max(0,Math.min(source.getWidth()-1,Math.round(x)));
+                    int cy=Math.max(0,Math.min(source.getHeight()-1,Math.round(y)));
+                    int left=Math.max(0,Math.min(source.getWidth()-1,cx-radiusX));
+                    int top=Math.max(0,Math.min(source.getHeight()-1,cy-radiusY));
+                    int right=Math.min(source.getWidth(),left+radiusX*2);
+                    int bottom=Math.min(source.getHeight(),top+radiusY*2);
+                    Bitmap crop=Bitmap.createBitmap(source,left,top,Math.max(1,right-left),Math.max(1,bottom-top));
+                    Bitmap scaled=Bitmap.createScaledBitmap(crop,physicalPx(30f,true)-dp(2),physicalPx(20f,false)-dp(2),true);
+                    crop.recycle();
+                    Bitmap finalBitmap=scaled;
+                    handler.post(()->showMagnifierBitmap(finalBitmap));
+                } catch(Exception ignored) {
+                } finally {
+                    magnifierCapturePending = false;
+                    if(source!=null)source.recycle();
+                    if(hb!=null)hb.close();
+                }
+                }
+                @Override public void onFailure(int errorCode) { magnifierCapturePending = false; }
+            });
+        } catch(Exception ignored) { magnifierCapturePending = false; }
+    }
+
+    private void showMagnifierBitmap(Bitmap bitmap) {
+        if(!magnifierEnabled || wm==null || bitmap==null)return;
+        if(magnifierView==null){
+            ImageView iv=new ImageView(this);
+            GradientDrawable bg=new GradientDrawable();
+            bg.setColor(Color.WHITE); bg.setStroke(dp(2),Color.rgb(45,45,55)); bg.setCornerRadius(dp(6));
+            iv.setBackground(bg); iv.setPadding(dp(1),dp(1),dp(1),dp(1));
+            magnifierView=iv;
+            int lensW = physicalPx(30f, true);
+            int lensH = physicalPx(20f, false);
+            magnifierLp=new WindowManager.LayoutParams(lensW,lensH,WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE|WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE|WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT);
+            magnifierLp.gravity=Gravity.TOP|Gravity.LEFT;
+            try{wm.addView(magnifierView,magnifierLp);}catch(Exception ignored){magnifierView=null;return;}
+        }
+        Bitmap old=magnifierBitmap;
+        magnifierBitmap=bitmap;
+        ((ImageView)magnifierView).setImageBitmap(bitmap);
+        if(old!=null && old!=bitmap){ try{old.recycle();}catch(Exception ignored){} }
+        // Keep the small lens beside the pointer rather than directly over it.
+        // This prevents the lens itself from entering the captured source area
+        // and creating a recursive/self-magnifying image.
+        float cx = x + cursorSize / 2f;
+        float cy = y + cursorSize / 2f;
+        int gap = dp(10);
+        int lx = Math.round(cx + gap);
+        int ly = Math.round(cy + gap);
+        if (lx + magnifierLp.width > screenW) lx = Math.round(cx - gap - magnifierLp.width);
+        if (ly + magnifierLp.height > screenH) ly = Math.round(cy - gap - magnifierLp.height);
+        magnifierLp.x=Math.max(0,Math.min(screenW-magnifierLp.width,lx));
+        magnifierLp.y=Math.max(0,Math.min(screenH-magnifierLp.height,ly));
+        try{wm.updateViewLayout(magnifierView,magnifierLp);}catch(Exception ignored){}
+    }
+
+    private void hideMagnifier(){
+        if(magnifierView!=null&&wm!=null){try{wm.removeView(magnifierView);}catch(Exception ignored){}}
+        magnifierView=null;magnifierLp=null;
+        if(magnifierBitmap!=null){try{magnifierBitmap.recycle();}catch(Exception ignored){}}
+        magnifierBitmap=null;
+    }
+
+    private void addResizeHandle(FrameLayout panel, int gravity, int horizontalDir, int verticalDir) {
+        TextView handle = new TextView(this);
+        String glyph = horizontalDir < 0 ? "↙" : "↘";
+        handle.setText(glyph);
+        handle.setTextSize(18);
+        handle.setTextColor(Color.rgb(10,38,92));
+        handle.setGravity(Gravity.CENTER);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(Color.argb(235,225,232,242));
+        bg.setStroke(dp(1), Color.rgb(45,45,55));
+        bg.setCornerRadius(dp(6));
+        handle.setBackground(bg);
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(dp(42), dp(42));
+        lp.gravity = gravity;
+        panel.addView(handle, lp);
+
+        final float[] lastX = {0f};
+        handle.setOnTouchListener((v,e)->{
+            if(mousePanelLp==null || wm==null || mousePanel==null) return true;
+            if(e.getAction()==MotionEvent.ACTION_DOWN){
+                lastX[0]=e.getRawX();
+                pressLight(v);
+                return true;
+            }
+            if(e.getAction()==MotionEvent.ACTION_MOVE){
+                float dx=e.getRawX()-lastX[0];
+                // Resize strictly from the horizontal edge. Height is always derived
+                // from the real 430:287 artwork ratio, so neither corner can distort it.
+                float delta = horizontalDir>0 ? dx : -dx;
+                int oldW=mousePanelLp.width;
+                int minW=dp(220);
+                int maxW=Math.max(minW,screenW-dp(4));
+                int newW=Math.max(minW,Math.min(maxW,oldW+Math.round(delta)));
+                int newH=Math.max(dp(147),Math.round(newW*287f/430f));
+                if(newH>screenH-dp(4)){
+                    newH=screenH-dp(4);
+                    newW=Math.max(minW,Math.round(newH*430f/287f));
+                    newW=Math.min(newW,maxW);
+                    newH=Math.round(newW*287f/430f);
+                }
+                int oldRight=mousePanelLp.x+oldW;
+                int oldBottom=mousePanelLp.y+mousePanelLp.height;
+                int newX=horizontalDir<0 ? oldRight-newW : mousePanelLp.x;
+                int newY=oldBottom-newH;
+                newX=Math.max(0,Math.min(screenW-newW,newX));
+                newY=Math.max(0,Math.min(screenH-newH,newY));
+                mousePanelLp.x=newX; mousePanelLp.y=newY;
+                mousePanelLp.width=newW; mousePanelLp.height=newH;
+                try{wm.updateViewLayout(mousePanel,mousePanelLp);}catch(Exception ignored){}
+                lastX[0]=e.getRawX();
+                return true;
+            }
+            if(e.getAction()==MotionEvent.ACTION_UP || e.getAction()==MotionEvent.ACTION_CANCEL){
+                clearPressLight(v);
+                return true;
+            }
+            return true;
+        });
+    }
+
+    private void toggleAutoTargetMode() {
+        autoTargetMode = !autoTargetMode;
+        if (autoTargetButton != null) {
+            autoTargetButton.setText(autoTargetMode ? "حرکت خودکار: روشن" : "حرکت خودکار: خاموش");
+        }
+        handler.removeCallbacks(autoTargetRunnable);
+        releaseSnap();
+        if (autoTargetMode) {
+            // Small, precise snap zone; the cursor is never pulled across the screen.
+            snapToNearbyClickable();
+        }
+    }
+
+    private void stopAutoTargetMode() {
+        autoTargetMode = false;
+        handler.removeCallbacks(autoTargetRunnable);
+        releaseSnap();
+        if (autoTargetButton != null) autoTargetButton.setText("حرکت خودکار: خاموش");
+    }
+
+    private void snapToNearbyClickable() {
+        if (!autoTargetMode || cursor == null || dragMode) return;
+        if (!snapReleased && snappedTargetRect != null) {
+            float cx = x + cursorSize / 2f;
+            float cy = y + cursorSize / 2f;
+            float dx = Math.max(snappedTargetRect.left - cx, Math.max(0f, cx - snappedTargetRect.right));
+            float dy = Math.max(snappedTargetRect.top - cy, Math.max(0f, cy - snappedTargetRect.bottom));
+            float dist = (float)Math.hypot(dx, dy);
+            if (dist < 24f) return;
+            releaseSnap();
+        }
+        android.view.accessibility.AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) return;
+        java.util.ArrayList<android.view.accessibility.AccessibilityNodeInfo> targets = new java.util.ArrayList<>();
+        try {
+            collectClickableTargets(root, targets);
+        } finally {
+            root.recycle();
+        }
+        if (targets.isEmpty()) return;
+
+        // Precise snap radius: about 3 mm, not 30 mm. The old 30 mm zone was
+        // far too strong on phones and made nearby controls capture the cursor.
+        android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
+        float pxPerMmX = Math.max(1f, dm.xdpi / 25.4f);
+        float pxPerMmY = Math.max(1f, dm.ydpi / 25.4f);
+        float thresholdX = pxPerMmX * 3f;
+        float thresholdY = pxPerMmY * 3f;
+        float hx = x + 2f;
+        float hy = y + 2f;
+        android.view.accessibility.AccessibilityNodeInfo best = null;
+        android.graphics.Rect bestRect = null;
+        float bestDist = Float.MAX_VALUE;
+        try {
+            for (android.view.accessibility.AccessibilityNodeInfo n : targets) {
+                android.graphics.Rect r = new android.graphics.Rect();
+                n.getBoundsInScreen(r);
+                if (r.width() <= 0 || r.height() <= 0) continue;
+                float nx = Math.max(r.left, Math.min(hx, r.right));
+                float ny = Math.max(r.top, Math.min(hy, r.bottom));
+                float dx = hx - nx;
+                float dy = hy - ny;
+                float normalizedX = dx / Math.max(1f, thresholdX);
+                float normalizedY = dy / Math.max(1f, thresholdY);
+                float dist = (float)Math.sqrt(normalizedX * normalizedX + normalizedY * normalizedY);
+                if (dist <= 1f && dist < bestDist) {
+                    bestDist = dist;
+                    best = n;
+                    bestRect = r;
+                }
+            }
+            if (best != null && bestRect != null) {
+                // Lock the first snapped target until the cursor is deliberately
+                // dragged away. This prevents immediate re-capture of the same control.
+                releaseSnap();
+                snappedTarget = AccessibilityNodeInfo.obtain(best);
+                snappedTargetRect = new android.graphics.Rect(bestRect);
+                snapReleased = false;
+                // Put the hotspot on the nearest point inside the clickable bounds.
+                float nx = Math.max(bestRect.left, Math.min(hx, bestRect.right));
+                float ny = Math.max(bestRect.top, Math.min(hy, bestRect.bottom));
+                moveCursorToScreenPoint(nx - 2f, ny - 2f);
+            }
+        } finally {
+            for (android.view.accessibility.AccessibilityNodeInfo n : targets) {
+                try { n.recycle(); } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    private void moveToNextClickableTarget() {
+        if (cursor == null || wm == null) return;
+        android.view.accessibility.AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) return;
+        java.util.ArrayList<android.view.accessibility.AccessibilityNodeInfo> targets = new java.util.ArrayList<>();
+        try {
+            collectClickableTargets(root, targets);
+        } finally {
+            root.recycle();
+        }
+        if (targets.isEmpty()) return;
+
+        // Choose the next target in screen order. Keep an index in a field so
+        // repeated timer ticks walk through links/buttons instead of staying put.
+        int start = autoTargetIndex % targets.size();
+        android.view.accessibility.AccessibilityNodeInfo target = targets.get(start);
+        autoTargetIndex = (start + 1) % targets.size();
+
+        android.graphics.Rect r = new android.graphics.Rect();
+        target.getBoundsInScreen(r);
+        target.recycle();
+
+        if (r.width() <= 0 || r.height() <= 0) return;
+        float tx = r.left + Math.min(r.width() / 2f, 20f);
+        float ty = r.top + Math.min(r.height() / 2f, 20f);
+        moveCursorToScreenPoint(tx, ty);
+    }
+
+    private int autoTargetIndex = 0;
+
+    private void collectClickableTargets(android.view.accessibility.AccessibilityNodeInfo node,
+                                         java.util.ArrayList<android.view.accessibility.AccessibilityNodeInfo> out) {
+        if (node == null) return;
+        android.graphics.Rect r = new android.graphics.Rect();
+        node.getBoundsInScreen(r);
+        boolean usable = node.isVisibleToUser() && r.width() > 4 && r.height() > 4;
+        boolean clickable = node.isClickable();
+        if (!clickable && Build.VERSION.SDK_INT >= 21) {
+            java.util.List<android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction> actions = node.getActionList();
+            for (android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction a : actions) {
+                if (a.getId() == android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK) {
+                    clickable = true;
+                    break;
+                }
+            }
+        }
+        if (usable && clickable) out.add(android.view.accessibility.AccessibilityNodeInfo.obtain(node));
+
+        for (int i = 0; i < node.getChildCount(); i++) {
+            android.view.accessibility.AccessibilityNodeInfo child = node.getChild(i);
+            if (child != null) {
+                collectClickableTargets(child, out);
+                child.recycle();
+            }
+        }
+    }
+
+    private void moveCursorToScreenPoint(float tx, float ty) {
+        if (cursor == null || wm == null) return;
+        // x/y are the cursor hotspot, so do not subtract cursorSize here.
+        // This permits the hotspot itself to reach the last pixel of the
+        // navigation bar instead of stopping one cursor-width above it.
+        float maxX = Math.max(0, screenW - 1f);
+        float maxY = Math.max(0, screenH - 1f);
+        x = Math.max(0, Math.min(maxX, tx));
+        y = Math.max(0, Math.min(maxY, ty));
+        WindowManager.LayoutParams lp = (WindowManager.LayoutParams) cursor.getTag();
+        lp.x = Math.round(x);
+        lp.y = Math.round(y);
+        try { wm.updateViewLayout(cursor, lp); } catch (Exception ignored) {}
+    }
+
+    public void hideMouseOverlay() {
+        stopAutoTargetMode();
+        magnifierEnabled=false;
+        hideMagnifier();
+        if (mousePanel != null && wm != null) { try { wm.removeView(mousePanel); } catch(Exception ignored) {} }
+        mousePanel = null; mousePanelLp = null;
+        hideCursor();
+    }
+
+    private int physicalPx(float mm, boolean horizontal) {
+        android.util.DisplayMetrics dm=getResources().getDisplayMetrics();
+        float dpi=horizontal?dm.xdpi:dm.ydpi;
+        if(dpi<=0 || Float.isNaN(dpi) || Float.isInfinite(dpi)) dpi=dm.density*160f;
+        return Math.max(1, Math.round(mm*dpi/25.4f));
+    }
+
+    private int dp(int v) { return Math.round(v * getResources().getDisplayMetrics().density); }
+
+    private void hideCursor() {
+        if(cursor!=null && wm!=null){
+            try{wm.removeView(cursor);}catch(Exception ignored){}
+        }
+        cursor=null;
+    }
+
+    private void showCursor() {
+        if (cursor != null || wm == null) return;
+        cursor = new ComputerCursorView(this);
+        cursor.setElevation(20f);
+
+        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+            cursorSize, cursorSize,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
+            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        );
+        lp.gravity = Gravity.TOP | Gravity.LEFT;
+        // x/y are the cursor hotspot (the sharp arrow tip), not its center.
+        x = Math.max(0, screenW / 2f - cursorSize / 2f);
+        y = Math.max(0, screenH / 2f - cursorSize / 2f);
+        lp.x = Math.round(x);
+        lp.y = Math.round(y);
+        cursor.setTag(lp);
+        wm.addView(cursor, lp);
+        updateCursorAppearance(Color.BLACK);
+    }
+
+    private void updateCursorAppearance(int bg) {
+        if (cursor == null) return;
+        // Fixed desktop-style appearance requested for Fast Keyboard Nova:
+        // deep navy arrow with a darker navy outline.
+        int c = Color.rgb(10, 38, 92);
+        int outline = Color.rgb(2, 12, 34);
+        cursor.setCursorColors(c, outline);
+    }
+
+    public static float getPointZoomCenterX() {
+        MouseAccessibilityService s=instance;
+        return s==null ? -1f : s.x;
+    }
+
+    public static float getPointZoomCenterY() {
+        MouseAccessibilityService s=instance;
+        return s==null ? -1f : s.y;
+    }
+
+    public static void pushPointZoomBitmap(Bitmap bitmap) {
+        MouseAccessibilityService s=instance;
+        if (s==null || bitmap==null) { if(bitmap!=null) bitmap.recycle(); return; }
+        s.handler.post(() -> s.showMagnifierBitmap(bitmap));
+    }
+
+    public static void cancelPointZoom() {
+        MouseAccessibilityService s=instance;
+        if(s!=null){ s.magnifierEnabled=false; s.hideMagnifier(); }
+    }
+
+    public static void moveRelativeFromKeyboard(float dx, float dy) {
+        MouseAccessibilityService s = instance;
+        if (s != null) s.moveRelative(dx, dy);
+    }
+
+    public static void clickFromKeyboard(boolean right) {
+        MouseAccessibilityService s = instance;
+        if (s != null) s.click(right);
+    }
+
+    public static void toggleMagnifierFromKeyboard() {
+        MouseAccessibilityService s = instance;
+        if (s != null) s.toggleMagnifier();
+    }
+
+    /**
+     * Click the active application's accessible Send button. This is deliberately
+     * separate from the keyboard Enter key: the goal is to perform the same UI
+     * action as the blue Send button shown by sites such as ChatGPT.
+     */
+    public static boolean clickSendButtonFromKeyboard() {
+        MouseAccessibilityService s = instance;
+        return s != null && s.clickSendButton();
+    }
+
+    /**
+     * Click the active application's accessible file/attachment button.
+     * The site's own handler then opens its normal Android file chooser/storage explorer.
+     */
+    public static boolean clickFileButtonFromKeyboard() {
+        MouseAccessibilityService s = instance;
+        return s != null && s.clickFileButton();
+    }
+
+    private String getForegroundPackageFromUsage() {
+        try {
+            if (Build.VERSION.SDK_INT < 21) return "";
+            UsageStatsManager usm = (UsageStatsManager)getSystemService(USAGE_STATS_SERVICE);
+            if (usm == null) return "";
+            long end = System.currentTimeMillis();
+            java.util.List<UsageStats> stats = usm.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, end - 30000L, end);
+            if (stats == null || stats.isEmpty()) return "";
+            String own = getPackageName(); UsageStats best = null;
+            for (UsageStats u : stats) {
+                if (u == null || u.getPackageName() == null || own.equals(u.getPackageName())) continue;
+                if (best == null || u.getLastTimeUsed() > best.getLastTimeUsed()) best = u;
+            }
+            return best == null ? "" : best.getPackageName();
+        } catch (Exception ignored) { return ""; }
+    }
+
+    private java.util.ArrayList<AccessibilityNodeInfo> targetRoots() {
+        java.util.ArrayList<AccessibilityNodeInfo> all = new java.util.ArrayList<>();
+        String own = getPackageName(); String fg = lastTargetPackage.isEmpty() ? getForegroundPackageFromUsage() : lastTargetPackage;
+        try {
+            AccessibilityNodeInfo active = getRootInActiveWindow();
+            if (active != null && !own.equals(active.getPackageName())) all.add(active);
+        } catch (Exception ignored) {}
+        try {
+            for (android.view.accessibility.AccessibilityWindowInfo w : getWindows()) {
+                if (w == null) continue; AccessibilityNodeInfo root = w.getRoot();
+                if (root == null || own.equals(root.getPackageName())) continue; all.add(root);
+            }
+        } catch (Exception ignored) {}
+        if (!fg.isEmpty()) {
+            java.util.ArrayList<AccessibilityNodeInfo> filtered = new java.util.ArrayList<>();
+            for (AccessibilityNodeInfo r : all) {
+                if (r != null && fg.equals(r.getPackageName())) filtered.add(r);
+                else try { if (r != null) r.recycle(); } catch (Exception ignored) {}
+            }
+            if (!filtered.isEmpty()) return filtered;
+        }
+        return all;
+    }
+
+    private boolean performNodeClick(AccessibilityNodeInfo n) {
+        if (n == null) return false;
+        try {
+            if (!n.isEnabled()) return false;
+            if (n.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true;
+            for (AccessibilityNodeInfo.AccessibilityAction a : n.getActionList())
+                if (a.getId() == AccessibilityNodeInfo.ACTION_CLICK && n.performAction(a.getId())) return true;
+        } catch (Exception ignored) {}
+        return false;
+    }
+
+    private void scheduleFileMenuClicks() {
+        handler.postDelayed(this::clickFileMenuItem, 250);
+        handler.postDelayed(this::clickFileMenuItem, 600);
+        handler.postDelayed(this::clickFileMenuItem, 1000);
+        handler.postDelayed(this::clickFileMenuItem, 1500);
+    }
+
+    private AccessibilityNodeInfo findBottomLeftSiteControl(ArrayList<AccessibilityNodeInfo> roots) {
+        AccessibilityNodeInfo best = null; float bestScore = Float.NEGATIVE_INFINITY;
+        Rect win = findTargetScreenBounds();
+        float yMin = win.top + win.height() * 0.68f;
+        for (AccessibilityNodeInfo root : roots) {
+            best = findBottomControlRecursive(root, best, true, yMin, win, bestScore);
+            if (best != null) {
+                Rect br = new Rect(); best.getBoundsInScreen(br);
+                bestScore = scoreBottomControl(br, true, win, yMin);
+            }
+        }
+        return best;
+    }
+
+    private AccessibilityNodeInfo findBottomRightSiteControl(ArrayList<AccessibilityNodeInfo> roots) {
+        AccessibilityNodeInfo best = null; float bestScore = Float.NEGATIVE_INFINITY;
+        Rect win = findTargetScreenBounds();
+        float yMin = win.top + win.height() * 0.68f;
+        for (AccessibilityNodeInfo root : roots) {
+            best = findBottomControlRecursive(root, best, false, yMin, win, bestScore);
+            if (best != null) {
+                Rect br = new Rect(); best.getBoundsInScreen(br);
+                bestScore = scoreBottomControl(br, false, win, yMin);
+            }
+        }
+        return best;
+    }
+
+    private AccessibilityNodeInfo findBottomControlRecursive(AccessibilityNodeInfo n, AccessibilityNodeInfo current, boolean left, float yMin, Rect win, float currentScore) {
+        if (n == null) return current;
+        try {
+            if (n.isVisibleToUser() && n.isEnabled() && n.isClickable()) {
+                Rect r = new Rect(); n.getBoundsInScreen(r);
+                if (r.width() >= 6 && r.height() >= 6 && r.centerY() >= yMin && r.bottom <= win.bottom + 20) {
+                    float score = scoreBottomControl(r, left, win, yMin);
+                    if (score > currentScore) {
+                        if (current != null) try { current.recycle(); } catch(Exception ignored) {}
+                        current = AccessibilityNodeInfo.obtain(n); currentScore = score;
+                    }
+                }
+            }
+            for (int i=0;i<n.getChildCount();i++) {
+                AccessibilityNodeInfo c=n.getChild(i);
+                if(c!=null) {
+                    current = findBottomControlRecursive(c,current,left,yMin,win,currentScore);
+                    if(current!=null){Rect cr=new Rect();current.getBoundsInScreen(cr);currentScore=scoreBottomControl(cr,left,win,yMin);}
+                    try{c.recycle();}catch(Exception ignored){}
+                }
+            }
+        } catch(Exception ignored) {}
+        return current;
+    }
+
+    private float scoreBottomControl(Rect r, boolean left, Rect win, float yMin) {
+        float y = (r.centerY()-yMin)/Math.max(1f, win.bottom-yMin);
+        float x = (r.centerX()-win.left)/Math.max(1f, win.width());
+        float side = left ? (1f-x) : x;
+        return y*100f + side*100f + Math.min(20f,r.width()*0.1f);
+    }
+
+    private boolean clickFileButton() {
+        if (Build.VERSION.SDK_INT < 21) return false;
+
+        java.util.ArrayList<android.view.accessibility.AccessibilityNodeInfo> candidates =
+                new java.util.ArrayList<>();
+        java.util.ArrayList<android.view.accessibility.AccessibilityNodeInfo> roots = targetRoots();
+        for (android.view.accessibility.AccessibilityNodeInfo root : roots) collectFileCandidates(root, candidates);
+        for (android.view.accessibility.AccessibilityNodeInfo root : roots) try { root.recycle(); } catch (Exception ignored) {}
+
+        android.view.accessibility.AccessibilityNodeInfo best = chooseBestFileCandidate(candidates);
+        for (android.view.accessibility.AccessibilityNodeInfo n : candidates) {
+            if (n != best) { try { n.recycle(); } catch (Exception ignored) {} }
+        }
+        if (best == null) return false;
+
+        boolean ok = false;
+        try {
+            if (best.isEnabled()) {
+                ok = best.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK);
+                if (!ok) {
+                    for (android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction a : best.getActionList()) {
+                        if (a.getId() == android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK) {
+                            ok = best.performAction(a.getId());
+                            break;
+                        }
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
+        try { best.recycle(); } catch (Exception ignored) {}
+        if (ok) {
+            // The site's own attachment control may open a second menu.
+            scheduleFileMenuClicks();
+            return true;
+        }
+
+        // WebViews frequently expose only the composer/editor, not the attachment
+        // icon. Tap the site's own lower-left composer area as a final fallback.
+        java.util.ArrayList<android.view.accessibility.AccessibilityNodeInfo> roots2 = targetRoots();
+        android.graphics.Rect composer = new android.graphics.Rect();
+        for (android.view.accessibility.AccessibilityNodeInfo root : roots2) findComposerBounds(root, composer);
+        for (android.view.accessibility.AccessibilityNodeInfo root : roots2) try { root.recycle(); } catch (Exception ignored) {}
+        if (composer.width() > 40 && composer.height() > 20) {
+            float x = composer.left + Math.max(20f, Math.min(64f, composer.height() * 0.70f));
+            float y = composer.bottom - Math.max(18f, Math.min(52f, composer.height() * 0.36f));
+            boolean tapped = tapScreenPoint(x, y);
+            if (tapped) {
+                handler.postDelayed(() -> tapScreenPoint(x + 18f, y), 120);
+                handler.postDelayed(() -> tapScreenPoint(x + 34f, y), 240);
+                scheduleFileMenuClicks();
+                handler.postDelayed(this::clickFileMenuItem, 1900);
+            }
+            return tapped;
+        }
+        // WebView fallback: locate the actual clickable control in the lower composer
+        // rather than guessing a fixed screen coordinate. Leftmost lower control is
+        // normally the site's attachment/+ button.
+        roots = targetRoots();
+        AccessibilityNodeInfo siteFile = findBottomLeftSiteControl(roots);
+        recycleRootsExcept(roots, siteFile);
+        if (siteFile != null) {
+            boolean siteOk = performNodeClick(siteFile);
+            try { siteFile.recycle(); } catch(Exception ignored) {}
+            if (siteOk) {
+                handler.postDelayed(this::clickFileMenuItem, 300);
+                handler.postDelayed(this::clickFileMenuItem, 700);
+                handler.postDelayed(this::clickFileMenuItem, 1200);
+                return true;
+            }
+        }
+        Rect area=findTargetScreenBounds();
+        if(area.width()>160 && area.height()>120){
+            float x=area.left+Math.max(24f,Math.min(64f,area.width()*0.09f));
+            float y=area.bottom-Math.max(28f,Math.min(58f,area.height()*0.065f));
+            boolean tapped=tapScreenPoint(x,y);
+            handler.postDelayed(() -> tapScreenPoint(x+18f,y),120);
+            handler.postDelayed(() -> tapScreenPoint(x+34f,y),240);
+            scheduleFileMenuClicks();
+            return tapped;
+        }
+        return false;
+    }
+
+    private boolean clickFileMenuItem() {
+        if (Build.VERSION.SDK_INT < 21) return false;
+        java.util.ArrayList<android.view.accessibility.AccessibilityNodeInfo> candidates = new java.util.ArrayList<>();
+        java.util.ArrayList<android.view.accessibility.AccessibilityNodeInfo> roots = targetRoots();
+        for (android.view.accessibility.AccessibilityNodeInfo root : roots) collectFileMenuCandidates(root, candidates);
+        for (android.view.accessibility.AccessibilityNodeInfo root : roots) try { root.recycle(); } catch (Exception ignored) {}
+        android.view.accessibility.AccessibilityNodeInfo best = chooseBestFileMenuCandidate(candidates);
+        for (android.view.accessibility.AccessibilityNodeInfo n : candidates) if (n != best) try { n.recycle(); } catch (Exception ignored) {}
+        if (best == null) return false;
+        boolean ok = false;
+        try { if (best.isEnabled()) ok = best.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK); } catch (Exception ignored) {}
+        try { best.recycle(); } catch (Exception ignored) {}
+        return ok;
+    }
+
+    private void collectFileMenuCandidates(android.view.accessibility.AccessibilityNodeInfo node, java.util.ArrayList<android.view.accessibility.AccessibilityNodeInfo> out) {
+        if (node == null) return;
+        try {
+            String text = node.getText() == null ? "" : node.getText().toString().toLowerCase(java.util.Locale.ROOT);
+            String desc = node.getContentDescription() == null ? "" : node.getContentDescription().toString().toLowerCase(java.util.Locale.ROOT);
+            String all = text + " " + desc;
+            boolean hit = all.contains("add files") || all.contains("add file") || all.contains("attach files") || all.contains("choose file") || all.contains("select file") || all.contains("انتخاب فایل") || all.contains("افزودن فایل") || all.contains("پیوست") || all.contains("ضمیمه");
+            if (hit && node.isVisibleToUser() && node.isEnabled() && node.isClickable()) out.add(android.view.accessibility.AccessibilityNodeInfo.obtain(node));
+            for (int i=0;i<node.getChildCount();i++) { android.view.accessibility.AccessibilityNodeInfo c=node.getChild(i); if(c!=null){ collectFileMenuCandidates(c,out); try{c.recycle();}catch(Exception ignored){} } }
+        } catch (Exception ignored) {}
+    }
+
+    private android.view.accessibility.AccessibilityNodeInfo chooseBestFileMenuCandidate(java.util.ArrayList<android.view.accessibility.AccessibilityNodeInfo> list) {
+        android.view.accessibility.AccessibilityNodeInfo best=null; int score=Integer.MIN_VALUE;
+        for (android.view.accessibility.AccessibilityNodeInfo n:list) {
+            String t=n.getText()==null?"":n.getText().toString().toLowerCase(java.util.Locale.ROOT);
+            String d=n.getContentDescription()==null?"":n.getContentDescription().toString().toLowerCase(java.util.Locale.ROOT);
+            int s=0; if(t.contains("add files")||d.contains("add files"))s+=150; if(t.contains("add file")||d.contains("add file"))s+=130; if(d.contains("attach files"))s+=120; if(t.contains("انتخاب فایل")||d.contains("انتخاب فایل"))s+=120; if(n.isClickable())s+=20; if(s>score){score=s;best=n;}
+        }
+        return best;
+    }
+
+    private void collectFileCandidates(android.view.accessibility.AccessibilityNodeInfo node,
+                                       java.util.ArrayList<android.view.accessibility.AccessibilityNodeInfo> out) {
+        if (node == null) return;
+        try {
+            if (isFileNode(node)) out.add(android.view.accessibility.AccessibilityNodeInfo.obtain(node));
+            for (int i = 0; i < node.getChildCount(); i++) {
+                android.view.accessibility.AccessibilityNodeInfo child = node.getChild(i);
+                if (child != null) {
+                    collectFileCandidates(child, out);
+                    try { child.recycle(); } catch (Exception ignored) {}
+                }
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private boolean isFileNode(android.view.accessibility.AccessibilityNodeInfo n) {
+        if (!n.isVisibleToUser() || !n.isEnabled()) return false;
+        String text = n.getText() == null ? "" : n.getText().toString().trim();
+        String desc = n.getContentDescription() == null ? "" : n.getContentDescription().toString().trim();
+        String viewId = n.getViewIdResourceName() == null ? "" : n.getViewIdResourceName();
+        String all = (text + " " + desc + " " + viewId).toLowerCase(java.util.Locale.ROOT);
+        if (all.isEmpty()) return false;
+
+        boolean label =
+                all.contains("add files and more") || all.contains("add photos and files") ||
+                all.contains("attach files") || all.contains("attach file") ||
+                all.contains("add files") || all.contains("add file") ||
+                all.contains("upload files") || all.contains("upload file") ||
+                all.contains("choose file") || all.contains("select file") ||
+                all.contains("انتخاب فایل") || all.contains("افزودن فایل") ||
+                all.contains("ضمیمه") || all.contains("پیوست") || all.contains("بارگذاری فایل");
+        boolean idHint =
+                all.contains("attach") || all.contains("attachment") ||
+                all.contains("file-upload") || all.contains("file_upload") ||
+                all.contains("upload-file") || all.contains("upload_file");
+        if (!label && !idHint) return false;
+
+        boolean actionClick = n.isClickable();
+        if (!actionClick) {
+            for (android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction a : n.getActionList()) {
+                if (a.getId() == android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK) {
+                    actionClick = true; break;
+                }
+            }
+        }
+        return actionClick;
+    }
+
+    private android.view.accessibility.AccessibilityNodeInfo chooseBestFileCandidate(
+            java.util.ArrayList<android.view.accessibility.AccessibilityNodeInfo> list) {
+        if (list.isEmpty()) return null;
+        android.view.accessibility.AccessibilityNodeInfo best = null;
+        int bestScore = Integer.MIN_VALUE;
+        int h = screenH > 0 ? screenH : getResources().getDisplayMetrics().heightPixels;
+        for (android.view.accessibility.AccessibilityNodeInfo n : list) {
+            int score = 0;
+            String text = n.getText() == null ? "" : n.getText().toString().trim().toLowerCase(java.util.Locale.ROOT);
+            String desc = n.getContentDescription() == null ? "" : n.getContentDescription().toString().trim().toLowerCase(java.util.Locale.ROOT);
+            String id = n.getViewIdResourceName() == null ? "" : n.getViewIdResourceName().toLowerCase(java.util.Locale.ROOT);
+            if (desc.contains("add files and more") || desc.contains("add photos and files")) score += 150;
+            if (desc.contains("attach files") || desc.contains("attach file")) score += 125;
+            if (text.contains("انتخاب فایل") || desc.contains("انتخاب فایل")) score += 115;
+            if (desc.contains("add files") || desc.contains("add file")) score += 110;
+            if (desc.contains("upload files") || desc.contains("upload file")) score += 100;
+            if (id.contains("attach") || id.contains("attachment") || id.contains("file-upload") || id.contains("file_upload")) score += 80;
+            if (n.isClickable()) score += 20;
+            android.graphics.Rect r = new android.graphics.Rect();
+            n.getBoundsInScreen(r);
+            // Attachment controls are normally near the lower message composer.
+            if (r.centerY() > h * 0.55f) score += 15;
+            if (r.width() > 0 && r.height() > 0) score += 5;
+            if (score > bestScore) { bestScore = score; best = n; }
+        }
+        return best;
+    }
+
+    private boolean clickSendButton() {
+        if (Build.VERSION.SDK_INT < 21) return false;
+        java.util.ArrayList<android.view.accessibility.AccessibilityNodeInfo> candidates = new java.util.ArrayList<>();
+        java.util.ArrayList<android.view.accessibility.AccessibilityNodeInfo> roots = targetRoots();
+        for (android.view.accessibility.AccessibilityNodeInfo root : roots) collectSendCandidates(root, candidates);
+        for (android.view.accessibility.AccessibilityNodeInfo root : roots) try { root.recycle(); } catch (Exception ignored) {}
+        android.view.accessibility.AccessibilityNodeInfo best = chooseBestSendCandidate(candidates);
+        for (android.view.accessibility.AccessibilityNodeInfo n : candidates) {
+            if (n != best) { try { n.recycle(); } catch (Exception ignored) {} }
+        }
+        if (best != null) {
+            try {
+                if (best.isEnabled() && best.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK)) {
+                    best.recycle(); return true;
+                }
+            } catch (Exception ignored) {}
+            try { best.recycle(); } catch (Exception ignored) {}
+        }
+        // WebView often exposes no accessible Send node. Search every interactive
+        // window for the largest lower editable composer, then tap its lower-right
+        // action area. This is still a site UI gesture, never an Enter key.
+        android.graphics.Rect composer = new android.graphics.Rect();
+        java.util.ArrayList<android.view.accessibility.AccessibilityNodeInfo> roots2 = targetRoots();
+        for (android.view.accessibility.AccessibilityNodeInfo root : roots2) findComposerBounds(root, composer);
+        for (android.view.accessibility.AccessibilityNodeInfo root : roots2) try { root.recycle(); } catch (Exception ignored) {}
+        if (composer.width() <= 40 || composer.height() <= 20) {
+            // WebView fallback: locate the actual clickable control at the lower-right
+            // edge of the active composer instead of relying on a fixed coordinate.
+            roots2 = targetRoots();
+            AccessibilityNodeInfo siteSend = findBottomRightSiteControl(roots2);
+            recycleRootsExcept(roots2, siteSend);
+            if (siteSend != null) {
+                boolean ok = performNodeClick(siteSend);
+                try { siteSend.recycle(); } catch(Exception ignored) {}
+                if (ok) return true;
+            }
+            Rect area=findTargetScreenBounds();
+            if(area.width()>160 && area.height()>120){
+                float bx=area.right-Math.max(28f,Math.min(64f,area.width()*0.09f));
+                float by=area.bottom-Math.max(28f,Math.min(58f,area.height()*0.065f));
+                boolean t=tapScreenPoint(bx,by);
+                handler.postDelayed(() -> tapScreenPoint(bx-16f,by),120);
+                handler.postDelayed(() -> tapScreenPoint(bx-30f,by),240);
+                return t;
+            }
+            return false;
+        }
+        boolean tapped = tapComposerSendFallback(null, composer);
+        if (tapped) {
+            android.graphics.Rect c = new android.graphics.Rect(composer);
+            handler.postDelayed(() -> tapComposerSendFallback(null, c), 180);
+            handler.postDelayed(() -> tapComposerSendFallback(null, c), 360);
+        }
+        return tapped;
+    }
+
+    private boolean tapComposerSendFallback(android.view.accessibility.AccessibilityNodeInfo ignored, android.graphics.Rect composer) {
+        if (Build.VERSION.SDK_INT < 24) return false;
+        if (composer == null || composer.width() <= 40 || composer.height() <= 20) return false;
+        float x = composer.right - Math.max(24, Math.min(72, composer.height() * 0.70f));
+        float y = composer.bottom - Math.max(16, Math.min(48, composer.height() * 0.38f));
+        return tapScreenPoint(x, y);
+    }
+
+    private boolean findComposerBounds(android.view.accessibility.AccessibilityNodeInfo node,
+                                       android.graphics.Rect out) {
+        if (node == null) return false;
+        try {
+            CharSequence cls = node.getClassName();
+            String c = cls == null ? "" : cls.toString().toLowerCase(java.util.Locale.ROOT);
+            boolean editable = node.isEditable() || c.contains("edittext") ||
+                    c.contains("editable") || c.contains("textinput");
+            if (editable && node.isVisibleToUser()) {
+                android.graphics.Rect r = new android.graphics.Rect();
+                node.getBoundsInScreen(r);
+                if (r.width() > out.width() && r.height() > out.height()) out.set(r);
+            }
+            for (int i=0;i<node.getChildCount();i++) {
+                android.view.accessibility.AccessibilityNodeInfo ch=node.getChild(i);
+                if(ch!=null){ findComposerBounds(ch,out); try{ch.recycle();}catch(Exception ignored){} }
+            }
+        } catch(Exception ignored){}
+        return out.width()>40 && out.height()>20;
+    }
+
+    private android.view.accessibility.AccessibilityNodeInfo findRightBottomClickable(
+            android.view.accessibility.AccessibilityNodeInfo node, android.graphics.Rect composer) {
+        if (node == null) return null;
+        android.view.accessibility.AccessibilityNodeInfo best=null;
+        int bestScore=Integer.MIN_VALUE;
+        try {
+            if (node.isVisibleToUser() && node.isEnabled() && node.isClickable()) {
+                android.graphics.Rect r=new android.graphics.Rect(); node.getBoundsInScreen(r);
+                int score=-10000;
+                if(r.width()>0 && r.height()>0 && r.centerX()>=composer.left && r.centerX()<=composer.right+30 &&
+                        r.centerY()>=composer.top && r.centerY()<=composer.bottom+30){
+                    score=100;
+                    int dx=Math.abs(composer.right-r.right);
+                    int dy=Math.abs(composer.bottom-r.bottom);
+                    score-=Math.min(80,dx*2+dy*2);
+                    String d=(String.valueOf(node.getContentDescription())+" "+String.valueOf(node.getViewIdResourceName())).toLowerCase(java.util.Locale.ROOT);
+                    if(d.contains("send")||d.contains("submit")||d.contains("ارسال")) score+=200;
+                }
+                if(score>bestScore){bestScore=score;best=android.view.accessibility.AccessibilityNodeInfo.obtain(node);}
+            }
+            for(int i=0;i<node.getChildCount();i++){
+                android.view.accessibility.AccessibilityNodeInfo ch=node.getChild(i);
+                if(ch!=null){
+                    android.view.accessibility.AccessibilityNodeInfo got=findRightBottomClickable(ch,composer);
+                    if(got!=null){
+                        android.graphics.Rect rr=new android.graphics.Rect();got.getBoundsInScreen(rr);
+                        int dx=Math.abs(composer.right-rr.right), dy=Math.abs(composer.bottom-rr.bottom);
+                        int sc=100-Math.min(80,dx*2+dy*2);
+                        String d=(String.valueOf(got.getContentDescription())+" "+String.valueOf(got.getViewIdResourceName())).toLowerCase(java.util.Locale.ROOT);
+                        if(d.contains("send")||d.contains("submit")||d.contains("ارسال")) sc+=200;
+                        if(sc>bestScore){if(best!=null)try{best.recycle();}catch(Exception ignored){} best=got;bestScore=sc;}else try{got.recycle();}catch(Exception ignored){}
+                    }
+                    try{ch.recycle();}catch(Exception ignored){}
+                }
+            }
+        } catch(Exception ignored){}
+        return bestScore>-9000?best:null;
+    }
+
+    private Rect findTargetScreenBounds() {
+        Rect out=new Rect();
+        try {
+            for (AccessibilityWindowInfo w : getWindows()) {
+                if(w==null) continue;
+                AccessibilityNodeInfo r=w.getRoot();
+                if(r==null) continue;
+                String pkg=r.getPackageName()==null?"":r.getPackageName().toString();
+                boolean own=getPackageName().equals(pkg);
+                if(!own && (lastTargetPackage.isEmpty() || lastTargetPackage.equals(pkg))){
+                    Rect b=new Rect(); w.getBoundsInScreen(b);
+                    if(b.width()>out.width() && b.height()>out.height()) out.set(b);
+                }
+                try{r.recycle();}catch(Exception ignored){}
+            }
+        }catch(Exception ignored){}
+        if(out.width()<=0 || out.height()<=0){
+            out.set(0,0,screenW,screenH);
+        }
+        return out;
+    }
+
+    private boolean tapScreenPoint(float x,float y){
+        if(Build.VERSION.SDK_INT<24)return false;
+        try{
+            android.graphics.Path p=new android.graphics.Path();p.moveTo(x,y);
+            GestureDescription.StrokeDescription stroke=new GestureDescription.StrokeDescription(p,0,80);
+            return dispatchGesture(new GestureDescription.Builder().addStroke(stroke).build(),null,null);
+        }catch(Exception e){return false;}
+    }
+
+    private void collectSendCandidates(android.view.accessibility.AccessibilityNodeInfo node,
+                                       java.util.ArrayList<android.view.accessibility.AccessibilityNodeInfo> out) {
+        if (node == null) return;
+        try {
+            if (isSendNode(node)) out.add(android.view.accessibility.AccessibilityNodeInfo.obtain(node));
+            for (int i = 0; i < node.getChildCount(); i++) {
+                android.view.accessibility.AccessibilityNodeInfo child = node.getChild(i);
+                if (child != null) {
+                    collectSendCandidates(child, out);
+                    try { child.recycle(); } catch (Exception ignored) {}
+                }
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private boolean isSendNode(android.view.accessibility.AccessibilityNodeInfo n) {
+        if (!n.isVisibleToUser() || !n.isEnabled()) return false;
+        String text = n.getText() == null ? "" : n.getText().toString().trim();
+        String desc = n.getContentDescription() == null ? "" : n.getContentDescription().toString().trim();
+        String viewId = n.getViewIdResourceName() == null ? "" : n.getViewIdResourceName();
+        String all = (text + " " + desc + " " + viewId).toLowerCase(java.util.Locale.ROOT);
+        if (all.isEmpty()) return false;
+
+        // Exact/near-exact labels used by ChatGPT and common web/app UIs.
+        boolean label =
+                all.equals("send") || all.equals("ارسال") ||
+                all.contains("send message") || all.contains("send prompt") ||
+                all.contains("send_button") || all.contains("send-button") ||
+                all.contains("sendbutton") || all.contains("send prompt") || all.contains("send message") ||
+                all.contains("submit") ||
+                all.contains("ارسال پیام") || all.contains("ارسال") ||
+                all.contains("ارسال پیام") || all.contains("submit message");
+        if (!label) return false;
+
+        boolean actionClick = n.isClickable();
+        if (!actionClick && Build.VERSION.SDK_INT >= 21) {
+            for (android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction a : n.getActionList()) {
+                if (a.getId() == android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK) {
+                    actionClick = true; break;
+                }
+            }
+        }
+        return actionClick;
+    }
+
+    private android.view.accessibility.AccessibilityNodeInfo chooseBestSendCandidate(
+            java.util.ArrayList<android.view.accessibility.AccessibilityNodeInfo> list) {
+        if (list.isEmpty()) return null;
+        android.view.accessibility.AccessibilityNodeInfo best = null;
+        int bestScore = Integer.MIN_VALUE;
+        int h = screenH > 0 ? screenH : getResources().getDisplayMetrics().heightPixels;
+        for (android.view.accessibility.AccessibilityNodeInfo n : list) {
+            int score = 0;
+            String text = n.getText() == null ? "" : n.getText().toString().trim().toLowerCase(java.util.Locale.ROOT);
+            String desc = n.getContentDescription() == null ? "" : n.getContentDescription().toString().trim().toLowerCase(java.util.Locale.ROOT);
+            if (text.equals("send") || text.equals("ارسال")) score += 100;
+            if (desc.contains("send prompt") || desc.contains("send message") || desc.contains("ارسال پیام")) score += 90;
+            if (n.isClickable()) score += 20;
+            android.graphics.Rect r = new android.graphics.Rect();
+            n.getBoundsInScreen(r);
+            // Send controls are normally in the lower input area. This is only a
+            // tie-breaker and never replaces label matching.
+            if (r.centerY() > h * 0.55f) score += 15;
+            if (r.width() > 0 && r.height() > 0) score += 5;
+            if (score > bestScore) { bestScore = score; best = n; }
+        }
+        return best;
+    }
+
+    // Wi-Fi touch-remote bridge. These methods are intentionally public static so the
+    // receiver can deliver packets without changing the existing keyboard mouse controls.
+    public void moveRelativeFromRemote(float dx, float dy) { moveRelative(dx, dy); }
+    public void clickFromRemote(boolean right) { click(right); }
+    public void beginDragFromRemote() { beginDragFromKeyboard(); }
+    public void endDragFromRemote() { endDragFromKeyboard(); }
+    public void scrollFromRemote(float dy) {
+        int direction = dy > 0 ? 1 : (dy < 0 ? -1 : 0);
+        if (direction == 0 || Build.VERSION.SDK_INT < 24) {
+            remoteScrollDirection = 0;
+            return;
+        }
+        remoteScrollDirection = direction;
+        startRemoteScrollIfNeeded();
+    }
+
+    private void startRemoteScrollIfNeeded() {
+        if (remoteScrollRunning || remoteScrollDirection == 0 || Build.VERSION.SDK_INT < 24) return;
+        remoteScrollRunning = true;
+        dispatchRemoteScrollStep();
+    }
+
+    private void dispatchRemoteScrollStep() {
+        if (remoteScrollDirection == 0 || Build.VERSION.SDK_INT < 24) {
+            remoteScrollRunning = false;
+            return;
+        }
+        // Prefer the platform's semantic scroll action. It is much smoother and more
+        // reliable for WebView/ScrollView/list content than a chain of synthetic swipes.
+        if (performRemoteScrollAction(remoteScrollDirection)) {
+            handler.postDelayed(this::dispatchRemoteScrollStep, 95L);
+            return;
+        }
+        if (cursor == null) showCursor();
+        float cx = x + cursorSize / 2f;
+        float cy = y + cursorSize / 2f;
+        float amount = remoteScrollDirection < 0 ? -26f : 26f;
+        Path path = new Path();
+        path.moveTo(cx, cy);
+        path.lineTo(cx, cy - amount);
+        GestureDescription.StrokeDescription stroke =
+            new GestureDescription.StrokeDescription(path, 0, 95);
+        dispatchGesture(new GestureDescription.Builder().addStroke(stroke).build(),
+            new GestureResultCallback() {
+                @Override public void onCompleted(GestureDescription g) { scheduleNextRemoteScroll(); }
+                @Override public void onCancelled(GestureDescription g) { scheduleNextRemoteScroll(); }
+            }, null);
+    }
+
+    private boolean performRemoteScrollAction(int direction) {
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        AccessibilityNodeInfo target = findScrollableNode(root);
+        if (root != null) root.recycle();
+        if (target == null) return false;
+        try {
+            int action = direction < 0 ? AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+                                       : AccessibilityNodeInfo.ACTION_SCROLL_FORWARD;
+            return target.performAction(action);
+        } catch (Exception ignored) {
+            return false;
+        } finally {
+            try { target.recycle(); } catch (Exception ignored) {}
+        }
+    }
+
+    private AccessibilityNodeInfo findScrollableNode(AccessibilityNodeInfo node) {
+        if (node == null) return null;
+        if (node.isScrollable()) return AccessibilityNodeInfo.obtain(node);
+        for (int i=0;i<node.getChildCount();i++) {
+            AccessibilityNodeInfo child = node.getChild(i);
+            AccessibilityNodeInfo found = findScrollableNode(child);
+            if (child != null) child.recycle();
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    private void scheduleNextRemoteScroll() {
+        if (remoteScrollDirection == 0) {
+            remoteScrollRunning = false;
+            return;
+        }
+        handler.postDelayed(this::dispatchRemoteScrollStep, 18L);
+    }
+
+    /**
+     * Remote Copy action. This is deliberately node-based: it never calls click(),
+     * so pressing Copy cannot accidentally become a left click.
+     */
+    public void copyFromRemote() {
+        performFocusedTextAction(AccessibilityNodeInfo.ACTION_COPY);
+    }
+
+    /**
+     * Remote Paste action. This is deliberately node-based: it never calls click(),
+     * so pressing Paste cannot accidentally become a left click.
+     */
+    public void pasteFromRemote() {
+        performFocusedTextAction(AccessibilityNodeInfo.ACTION_PASTE);
+    }
+
+    private boolean performFocusedTextAction(int action) {
+        if (Build.VERSION.SDK_INT < 18) return false;
+        try {
+            AccessibilityNodeInfo root = getRootInActiveWindow();
+            if (root == null) return false;
+            AccessibilityNodeInfo focused = null;
+            try {
+                focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
+                if (focused == null && Build.VERSION.SDK_INT >= 18) {
+                    focused = root.findFocus(AccessibilityNodeInfo.FOCUS_ACCESSIBILITY);
+                }
+                if (focused == null) return false;
+                return focused.performAction(action);
+            } finally {
+                if (focused != null) try { focused.recycle(); } catch (Exception ignored) {}
+                try { root.recycle(); } catch (Exception ignored) {}
+            }
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /** A modest single page-step for a short tap on the remote Page Up/Page Down buttons. */
+    public void pageFromRemote(int direction) {
+        if (direction == 0 || Build.VERSION.SDK_INT < 24) return;
+        remoteScrollDirection = 0;
+        if (performRemoteScrollAction(direction)) return;
+        if (cursor == null) showCursor();
+        float cx = x + cursorSize / 2f;
+        float cy = y + cursorSize / 2f;
+        float amount = direction < 0 ? -85f : 85f;
+        Path path = new Path();
+        path.moveTo(cx, cy);
+        path.lineTo(cx, cy - amount);
+        GestureDescription.StrokeDescription stroke =
+            new GestureDescription.StrokeDescription(path, 0, 150);
+        dispatchGesture(new GestureDescription.Builder().addStroke(stroke).build(), null, null);
+    }
+
+    public static String[] getTouchRemoteWifiAddresses() {
+        return TouchRemoteWifiReceiver.getLocalIpv4Addresses();
+    }
+
+    public static void resetFromKeyboard() {
+        MouseAccessibilityService s = instance;
+        if (s != null) s.resetCursor();
+    }
+
+    public static void beginDragFromKeyboard() {
+        MouseAccessibilityService s=instance;
+        if(s!=null){s.dragMode=true;}
+    }
+
+    public static void endDragFromKeyboard() {
+        MouseAccessibilityService s=instance;
+        if(s!=null){s.dragMode=false; s.releaseSnap();}
+    }
+
+    public static boolean toggleSelectFromKeyboard() {
+        MouseAccessibilityService s=instance;
+        if(s==null) return false;
+        s.selectMode = !s.selectMode;
+        return s.selectMode;
+    }
+
+    public static boolean isSelectModeFromKeyboard() {
+        MouseAccessibilityService s=instance;
+        return s != null && s.selectMode;
+    }
+
+    public static void scrollFromKeyboard(int direction) {
+        MouseAccessibilityService s=instance;
+        if(s!=null) s.scroll(direction);
+    }
+
+    public static void toggleAutoTargetFromKeyboard() {
+        MouseAccessibilityService s=instance;
+        if(s!=null) s.toggleAutoTargetMode();
+    }
+
+    private void scroll(int direction) {
+        if (Build.VERSION.SDK_INT < 24) return;
+        if (cursor == null) showCursor();
+        float cx=x+cursorSize/2f;
+        float cy=y+cursorSize/2f;
+        float amount=direction<0 ? -90f : 90f;
+        Path path=new Path();
+        path.moveTo(cx,cy);
+        path.lineTo(cx,cy);
+        GestureDescription.StrokeDescription stroke =
+            new GestureDescription.StrokeDescription(path,0,60);
+        // Accessibility has no universal synthetic mouse-wheel event. A short
+        // swipe at the cursor is used as the compatibility fallback for scrollable views.
+        Path scrollPath=new Path();
+        scrollPath.moveTo(cx,cy);
+        scrollPath.lineTo(cx,cy-amount);
+        GestureDescription.StrokeDescription scrollStroke =
+            new GestureDescription.StrokeDescription(scrollPath,0,180);
+        dispatchGesture(new GestureDescription.Builder().addStroke(scrollStroke).build(),null,null);
+    }
+
+    private void moveRelative(float dx, float dy) {
+        if (cursor == null) showCursor();
+        float oldX=x, oldY=y;
+        // Keep the pointer hotspot inside the complete physical display.
+        // This explicitly includes the status and navigation bars.
+        float maxX = Math.max(0, screenW - 1f);
+        float maxY = Math.max(0, screenH - 1f);
+        x = Math.max(0, Math.min(maxX, x + dx));
+        y = Math.max(0, Math.min(maxY, y + dy));
+        WindowManager.LayoutParams lp = (WindowManager.LayoutParams)cursor.getTag();
+        lp.x = Math.round(x);
+        lp.y = Math.round(y);
+        wm.updateViewLayout(cursor, lp);
+        if (autoTargetMode && !dragMode) snapToNearbyClickable();
+        if (magnifierEnabled && Build.VERSION.SDK_INT >= 30) {
+            updateMagnifier();
+        }
+        if(dragMode && Build.VERSION.SDK_INT>=24){
+            dispatchSwipe(oldX+3f,oldY+3f,x+3f,y+3f,12);
+        }
+    }
+
+    private void releaseSnap() {
+        if (snappedTarget != null) { try { snappedTarget.recycle(); } catch (Exception ignored) {} }
+        snappedTarget = null;
+        snappedTargetRect = null;
+        snapReleased = true;
+    }
+
+    private void resetCursor() {
+        x = Math.max(0, screenW / 2f - cursorSize / 2f);
+        y = Math.max(0, screenH / 2f - cursorSize / 2f);
+        WindowManager.LayoutParams lp = (WindowManager.LayoutParams)cursor.getTag();
+        lp.x = Math.round(x); lp.y = Math.round(y);
+        wm.updateViewLayout(cursor, lp);
+    }
+
+    private void dispatchSwipe(float sx,float sy,float ex,float ey,long duration){
+        Path path=new Path();
+        path.moveTo(sx,sy);
+        path.lineTo(ex,ey);
+        GestureDescription.StrokeDescription stroke=new GestureDescription.StrokeDescription(path,0,Math.max(12,duration));
+        dispatchGesture(new GestureDescription.Builder().addStroke(stroke).build(),null,null);
+    }
+
+    private void click(boolean right) {
+        if (cursor == null) showCursor();
+        if (cursor == null) return;
+        float cx = x + 2f;
+        float cy = y + 2f;
+
+        // First try the accessibility node actually under the cursor. This is more
+        // reliable for browser links, buttons and other accessible controls than
+        // relying only on a synthetic screen gesture.
+        boolean nodeHandled = performNodeClickAt(Math.round(cx), Math.round(cy), right);
+        if (nodeHandled) return;
+
+        // Fallback for arbitrary screen content: inject a real short touch gesture.
+        if (Build.VERSION.SDK_INT >= 24) {
+            Path p = new Path();
+            p.moveTo(cx, cy);
+            if (right) {
+                // Compatibility fallback: a long press behaves like a context/right click
+                // for many Android and WebView controls.
+                GestureDescription.StrokeDescription stroke =
+                    new GestureDescription.StrokeDescription(p, 0, 650);
+                dispatchGesture(new GestureDescription.Builder().addStroke(stroke).build(), null, null);
+            } else {
+                p.lineTo(cx + 1f, cy + 1f);
+                GestureDescription.StrokeDescription stroke =
+                    new GestureDescription.StrokeDescription(p, 0, 70);
+                dispatchGesture(new GestureDescription.Builder().addStroke(stroke).build(), null, null);
+            }
+        }
+    }
+
+    private boolean performNodeClickAt(int px, int py, boolean right) {
+        if (Build.VERSION.SDK_INT < 21) return false;
+        android.view.accessibility.AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) return false;
+        android.view.accessibility.AccessibilityNodeInfo node = findNodeAt(root, px, py);
+        if (node == null) return false;
+        try {
+            if (right && Build.VERSION.SDK_INT >= 23) {
+                // Prefer the real Android context-click action for a right click.
+                try {
+                    // Some SDK/API combinations do not expose ACTION_CONTEXT_CLICK; use long-click fallback.
+                    if (node.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_LONG_CLICK)) return true;
+                } catch (Throwable ignored) {}
+            }
+            if (node.isClickable() && node.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK)) return true;
+            // Some browser controls expose ACTION_CLICK without reporting clickable.
+            if (node.getActionList().toString().contains("ACTION_CLICK")) {
+                return node.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK);
+            }
+        } finally {
+            node.recycle();
+        }
+        return false;
+    }
+
+    private android.view.accessibility.AccessibilityNodeInfo findNodeAt(android.view.accessibility.AccessibilityNodeInfo node, int px, int py) {
+        android.graphics.Rect r = new android.graphics.Rect();
+        node.getBoundsInScreen(r);
+        if (!r.contains(px, py)) return null;
+        // Search children first so the most specific control at the cursor wins.
+        for (int i = node.getChildCount() - 1; i >= 0; i--) {
+            android.view.accessibility.AccessibilityNodeInfo child = node.getChild(i);
+            if (child == null) continue;
+            android.view.accessibility.AccessibilityNodeInfo hit = findNodeAt(child, px, py);
+            if (hit != null) return hit;
+            child.recycle();
+        }
+        return android.view.accessibility.AccessibilityNodeInfo.obtain(node);
+    }
+
+    /** Recycles accessibility roots except for the node selected for the pending action. */
+    private void recycleRootsExcept(ArrayList<AccessibilityNodeInfo> roots, AccessibilityNodeInfo keep) {
+        for (AccessibilityNodeInfo r : roots) {
+            if (r != null && r != keep) {
+                try { r.recycle(); } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    @Override public void onAccessibilityEvent(AccessibilityEvent event) {
+        try {
+            CharSequence pkg = event == null ? null : event.getPackageName();
+            if (pkg != null) {
+                String p = pkg.toString();
+                if (!getPackageName().equals(p)) lastTargetPackage = p;
+            }
+        } catch (Exception ignored) {}
+    }
+    @Override public void onInterrupt() { }
+
+    @Override public void onDestroy() {
+        if (touchRemoteWifiReceiver != null) { touchRemoteWifiReceiver.stop(); touchRemoteWifiReceiver = null; }
+        stopAutoTargetMode();
+        hideMagnifier();
+        instance = null;
+        if (cursor != null && wm != null) {
+            try { wm.removeView(cursor); } catch (Exception ignored) {}
+        }
+        cursor = null;
+        if (mousePanel != null && wm != null) { try { wm.removeView(mousePanel); } catch(Exception ignored) {} }
+        mousePanel = null;
+        super.onDestroy();
+    }
+}
+
